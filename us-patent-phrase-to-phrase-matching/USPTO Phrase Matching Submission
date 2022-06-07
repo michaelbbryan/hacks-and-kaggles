@@ -1,1 +1,168 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+"""
+This notebook provides the final material needed to generate and predict phrase matching with the expected CSV output.
 
+This process uses
+* Training and test data from the Kaggle competition named us-patent-phrase-to-phrase-matching
+* Bert's sentence transformer https://www.sbert.net/
+* with pretrained models maintained in https://huggingface.co/models?library=sentence-transformers
+* adding custom training data by using https://github.com/UKPLab/sentence-transformers/blob/master/examples/training/sts/training_stsbenchmark_continue_training.py
+
+The observations each have
+   anchor target pairs of phrases
+   a similarity score for each
+   a context, CPC code at the section and class level https://www.epo.org/searching-for-patents/helpful-resources/first-time-here/classification/cpc.html 
+
+Starting with a pretrained model (model_name)
+* For each CPC section, we will additionally training using the USPTO's train.csv dataset.
+* Then we'll predict the observations in the test.csv with the corresponded CPC section model.
+* The output is written to an output file named submission.csv.
+
+Additional ideas not implemented here:
+* use a GPU accelerator
+* for each model, first use the full training set, then 2*section training
+"""
+
+# imports & installations
+import logging
+import warnings
+import math
+import datetime
+import os
+import csv
+from scipy import spatial
+import pandas as pd
+import numpy as np
+
+logging.info("Starting")
+
+# Get the sentence-transformers package and base model to install offline/kaggle/input/all-mpnet-base-v2/sentence-transformers-2.2.0
+os.system("cp -R /kaggle/input/all-mpnet-base-v2/sentence-transformers-2.2.0/sentence-transformers-2.2.0 sentence_transformers/")
+os.chdir("sentence_transformers")
+os.system("pip freeze | grep sentence_transformers")
+os.system('pip install . --user')
+os.chdir("/kaggle/working")
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+from sentence_transformers import SentenceTransformer, LoggingHandler, losses, util, InputExample
+from sentence_transformers.evaluation import EmbeddingSimilarityEvaluator
+import transformers
+from torch.utils.data import DataLoader
+
+warnings.filterwarnings("ignore", category=DeprecationWarning) 
+logging.basicConfig(format='%(asctime)s - %(message)s', datefmt='%d-%b-%y %H:%M:%S')
+
+#
+# Prepare the dataset
+#
+logging.info("Data preparation starting")
+train = pd.read_csv("../input/us-patent-phrase-to-phrase-matching/train.csv")
+train["CPCsection"] = train.context.str[0:1]
+condition= [ train.id.str[0:1].isin(["a","b"]),
+             train.id.str[0:1].isin(["c","d"])]
+choice= ['valid','test']
+train['split'] =np.select(condition,choice,default="train")
+
+test = pd.read_csv("../input/us-patent-phrase-to-phrase-matching/test.csv")
+test["CPCsection"] = test.context.str[0:1]
+logging.info("Preparation complete")
+
+#
+# Find the best model to use
+#
+
+#anchors = list(train.anchor)
+#targets = list(train.target)
+#model_list = [\
+#'nli-distilroberta-base-v2','paraphrase-MiniLM-L6-v2','all-mpnet-base-v2','multi-qa-mpnet-base-dot-v1',\
+#'all-distilroberta-v1','all-MiniLM-L12-v2','multi-qa-distilbert-cos-v1','all-MiniLM-L6-v2',\
+#'multi-qa-MiniLM-L6-cos-v1','paraphrase-multilingual-mpnet-base-v2','paraphrase-albert-small-v2',\
+#'paraphrase-multilingual-MiniLM-L12-v2','paraphrase-MiniLM-L3-v2','distiluse-base-multilingual-cased-v1',
+#'distiluse-base-multilingual-cased-v2','allenai-specter']
+#for model_name in model_list:
+#    logging.info("Assessing model:",model_name)
+#    start = datetime.datetime.now()
+#    anchor_embeddings = model.encode(anchors, show_progress_bar=False)
+#    target_embeddings = model.encode(targets, show_progress_bar=False)
+#    cossim = []
+#    for obs in range(len(anchors)):
+#        cossim.append(1 - spatial.distance.cosine(anchor_embeddings[obs], target_embeddings[obs]))
+#    train["cossim"] = cossim
+#    logging.info("RESULTS:",model_name,train[["score","cossim"]].corr().loc['score', 'cossim'])
+#    logging.info("Duration seconds",datetime.datetime.now() - start)
+#RESULTS: all-distilroberta-v1 0.5583488857472672
+#RESULTS: all-MiniLM-L12-v2 0.5694256664564412
+#RESULTS: all-MiniLM-L6-v2 0.5629879231369358
+#RESULTS: all-mpnet-base-v2 0.5991837806813296
+#RESULTS: multi-qa-distilbert-cos-v1 0.5656456318447549
+#RESULTS: multi-qa-MiniLM-L6-cos-v1 0.5372786590223818
+#RESULTS: multi-qa-mpnet-base-dot-v1 0.5669447014383271
+#RESULTS: nli-distilroberta-base-v2 0.53364549644357
+#RESULTS: paraphrase-MiniLM-L6-v2 0.5474839911339193
+
+#
+# Train a model for each CPC section using a pretrained base model adding training observations
+#
+
+model_name = "/kaggle/input/all-mpnet-base-v2/all-mpnet-base-v2/all-mpnet-base-v2"
+train_batch_size = 32
+num_epochs = 4
+base_model = SentenceTransformer(model_name) #, device='cuda'
+models = {}
+for CPCsection in train.CPCsection.unique():
+    model_save_path = 'model_saves/patent-phrase-matching-'+CPCsection+'-'+model_name+datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    trn = train[train.CPCsection == CPCsection]
+    logging.info(CPCsection+": Training  ")
+    start = datetime.datetime.now()
+    model = base_model
+    logging.info(CPCsection+": Read train dataset")
+    train_samples = []
+    val_samples = []
+    test_samples = []
+    trn = train[train.CPCsection == CPCsection]
+    for i, phrase in trn.iterrows():
+        inp_example = InputExample(texts=[phrase['anchor'], phrase['target']], label=float(phrase['score']))
+        if   phrase['split'] == 'valid':
+            val_samples.append(inp_example)
+        elif phrase['split'] == 'test':
+            test_samples.append(inp_example)
+        else:
+            train_samples.append(inp_example)
+    train_dataloader = DataLoader(train_samples, shuffle=True, batch_size=train_batch_size)
+    train_loss = losses.CosineSimilarityLoss(model=model)
+    logging.info(CPCsection+": Using valid samples with initial evaluator")
+    evaluator = EmbeddingSimilarityEvaluator.from_input_examples(val_samples, name=('cpc-dev'+CPCsection), show_progress_bar=False)
+
+    logging.info(CPCsection+": Fitting")
+    model.fit(train_objectives=[(train_dataloader, train_loss)],
+              evaluator=evaluator,
+              epochs=num_epochs,
+              evaluation_steps=1000,
+              output_path=model_save_path)
+        
+    models[CPCsection] = model
+    logging.info(CPCsection+":Done")
+    
+logging.info("Training complete!")
+
+#
+# Predict & generate submission file
+#
+
+predictions = []
+
+for obs in test.iterrows():
+    prediction = {}
+    model = models[obs[1]["CPCsection"]]
+    anchor = model.encode(obs[1]["anchor"])
+    target = model.encode(obs[1]["target"])
+    prediction["id"] = obs[1]["id"]
+    prediction["score"] = util.pytorch_cos_sim(anchor, target).numpy()[0][0]
+    predictions.append(prediction)
+
+submission = pd.DataFrame(predictions)
+submission[['id', 'score']].to_csv('submission.csv', index=False)
+
+logging.info("Done. Submission file ready.")
