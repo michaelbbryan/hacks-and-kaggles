@@ -1,0 +1,340 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+This code generates a prediction.csv file for submission to kaggle's competition:
+        https://www.kaggle.com/competitions/amex-default-prediction.
+        
+The approach below 
+  -  begins with EDA that will be commented out for the final run
+  -  prepares the training data
+        reading CSV by chunks processing by customer_ID
+        using float 16 rather than float 64
+        reading only columns without too many NAs
+        replacing the surviving NAs with the median of each
+        selecting only those customers with at least PERIODS statements available
+        selecting only those PERIODS statements for each customer
+        converting categorical columns to dummy indicator cols
+  -  train an LSTM recurrent neural network with
+        4 layers, outputting a sigmoid
+        first layer units = number of features (~160)
+        next layers progressive reduce units by half
+  -  predicting a test data set to generate a submission.csv
+
+"""
+
+import pandas as pd
+import numpy as np
+import psutil
+import gc
+from datetime import datetime
+from itertools import compress
+from matplotlib import pyplot as plt
+import logging
+
+logFormatter = logging.Formatter("%(asctime)s [%(threadName)-12.12s] [%(levelname)-5.5s]  %(message)s")
+rootLogger = logging.getLogger()
+fileHandler = logging.FileHandler("amex.log")
+fileHandler.setFormatter(logFormatter)
+rootLogger.addHandler(fileHandler)
+consoleHandler = logging.StreamHandler()
+consoleHandler.setFormatter(logFormatter)
+rootLogger.addHandler(consoleHandler)
+logging.basicConfig(level=logging.DEBUG)
+
+logging.debug("STARTING: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+
+#
+# Exploratory Data Analysis (EDA)
+#
+# train_X
+#    5,531,451 observations, unique on customer_ID and S_2 (statement date)
+#    458,913 distinct customer_IDs
+#    S_2 is a statement date, multiple statements per customer
+#         statements available     # of customers
+#         13                           386034
+#         12                           10623
+#         1-11                         ~6000
+#    11 qualitative variables
+#    177 stardardized quantitative variables for 
+#     The distribution of these predictors is https://www.kaggle.com/competitions/amex-default-prediction/data?select=train_data.csv
+# train_y unique on customer_ID, target is  0:340,085   and    1:118,828
+# test_X has 11 million rows, twice the size as the training set.
+#
+# Key assumption:
+#     I wont be padding sequences, zeros would throw of the math
+#     BUT in test_X,  95.8% of customer_IDs have 6 or more statements!
+#     so, I'll train on custs' last six statements, ignoring others
+#     then, when I need to predict - I'll arbitrate those missing 4.2%
+
+#
+# Define utility functions for reading CSV by chunks and preprocessing
+#
+
+def preprocess(raw_X):
+    """
+    This function converts the data initially read from file
+    into an X object ready for training or inference
+        1. Drop all but the last PERIODS statements.
+        2. Drop all but those customers that have enough (PERIODS) number of statements.
+        3. Address missing values
+        4. Convert qualitative, categorical columns into dummy indicators
+    Note:
+        These datasets are very large, the dataframe variable is regularly reused.
+    The function returns:
+        a. the preprocessed results of raw_X
+        b. the section of raw_X that could not be preprocessed due to insufficient statements
+    """
+    
+    customers = list(raw_X.customer_ID.unique())
+    statements = raw_X.customer_ID.value_counts()
+    enough_statements = [c for c in customers if statements[c] >= PERIODS]
+    
+    # first lets reduce the dataset to just the last PERIODS statements
+    raw_X.sort_values(['customer_ID','S_2'], ascending=False, inplace=True)
+    raw_X = raw_X.groupby('customer_ID').head(PERIODS)
+    raw_X.reset_index(drop=True, inplace=True)
+    
+    # cache the X rows of insufficient statement customers, and remove them from the main object
+    not_enough_statements = raw_X[ ~raw_X.customer_ID.isin(enough_statements) ]
+
+    # for each of the customers with insufficient statements
+    #     add padding rows using duplicate of the oldest statement
+    pad_X = not_enough_statements.groupby('customer_ID').tail(1)   # take the oldest statement
+    pad_X.reset_index(drop=True, inplace=True)
+    S = pd.DataFrame(statements).reset_index()                     # get the num times it should be replicated
+    S.columns = ['customer_ID','times']
+    P = pd.merge(pad_X[['customer_ID','S_2','B_1','B_2']],S,how='inner',on='customer_ID')
+    Q = P.loc[P.index.repeat(6-P.times)].drop('times',axis=1) 
+    raw_X = pd.concat([ raw_X, Q ])
+    
+    # replace NAs with either the training median or a dummy category
+    for c in QUANTS:
+        raw_X[c].fillna(MEDS[c],inplace=True)
+    for c in QUALS:
+        raw_X[c].fillna('X',inplace=True)
+        
+    # convert categorical columns into indicator dummies
+    #     return that results
+    raw_X = pd.get_dummies(raw_X, columns=QUALS)
+    
+    # get_dummies can generate more or fewer columns than expect
+    #     for those missing, make a 0 column, for those extra drop them
+    for c in TRAINVARS:
+        if c not in raw_X.columns:
+            raw_X[c] = 0
+    dropem = []
+    for c in raw_X.columns:
+        if c not in TRAINVARS:
+            dropem.append(c)
+    raw_X.drop(dropem,axis=1,inplace=True)
+    
+    return raw_X
+
+
+#
+# Load datasets & preprocess
+#
+
+PERIODS = 6
+DATADIR = '../input/amex-default-prediction/'
+OUTDIR = './'
+PREDICTION_CHUNKSIZE = 500000
+BATCHSIZE = 64
+EPOCHS = 1
+
+excludes = ['S_3', 'D_42', 'D_43', 'D_46', 'D_48', 'D_49', 'D_50', 'P_3', 'D_53', 'S_7', 'D_56', 'S_9', 'D_61', 'D_62', 'B_17', 'D_66', 'D_73', 'D_76', 'D_77', 'R_9', 'D_82', 'B_29', 'D_87', 'D_88', 'D_105', 'D_106', 'R_26', 'D_108', 'D_110', 'D_111', 'B_39', 'S_27', 'B_42', 'D_132', 'D_134', 'D_135', 'D_136', 'D_137', 'D_138', 'D_142']
+allcolumns = ['customer_ID', 'S_2', 
+                             'S_11', 'S_12', 'S_13', 'S_15', 'S_16', 'S_17', 'S_18', 'S_19', 'S_20', 'S_22', 'S_23', 'S_24', 'S_25', 'S_26', 'S_27', 'S_3', 'S_5', 'S_6', 'S_7', 'S_8', 'S_9',
+                             'B_1', 'B_10', 'B_11', 'B_12', 'B_13', 'B_14', 'B_15', 'B_16', 'B_17', 'B_18', 'B_19', 'B_2', 'B_20', 'B_21', 'B_22', 'B_23', 'B_24', 'B_25', 'B_26', 'B_27', 'B_28', 'B_29', 'B_3', 'B_30', 'B_31', 'B_32', 'B_33', 'B_36', 'B_37', 'B_38', 'B_39', 'B_4', 'B_40', 'B_41', 'B_42', 'B_5', 'B_6', 'B_7', 'B_8', 'B_9', 
+                             'D_102', 'D_103', 'D_104', 'D_105', 'D_106', 'D_107', 'D_108', 'D_109', 'D_110', 'D_111', 'D_112', 'D_113', 'D_114', 'D_115', 'D_116', 'D_117', 'D_118', 'D_119', 'D_120', 'D_121', 'D_122', 'D_123', 'D_124', 'D_125', 'D_126', 'D_127', 'D_128', 'D_129', 'D_130', 'D_131', 'D_132', 'D_133', 'D_134', 'D_135', 'D_136', 'D_137', 'D_138', 'D_139', 'D_140', 'D_141', 'D_142', 'D_143', 'D_144', 'D_145', 'D_39', 'D_41', 'D_42', 'D_43', 'D_44', 'D_45', 'D_46', 'D_47', 'D_48', 'D_49', 'D_50', 'D_51', 'D_52', 'D_53', 'D_54', 'D_55', 'D_56', 'D_58', 'D_59', 'D_60', 'D_61', 'D_62', 'D_63', 'D_64', 'D_65', 'D_66', 'D_68', 'D_69', 'D_70', 'D_71', 'D_72', 'D_73', 'D_74', 'D_75', 'D_76', 'D_77', 'D_78', 'D_79', 'D_80', 'D_81', 'D_82', 'D_83', 'D_84', 'D_86', 'D_87', 'D_88', 'D_89', 'D_91', 'D_92', 'D_93', 'D_94', 'D_96', 
+                             'P_2', 'P_3', 'P_4', 
+                             'R_1', 'R_10', 'R_11', 'R_12', 'R_13', 'R_14', 'R_15', 'R_16', 'R_17', 'R_18', 'R_19', 'R_2', 'R_20', 'R_21', 'R_22', 'R_23', 'R_24', 'R_25', 'R_26', 'R_27', 'R_28', 'R_3', 'R_4', 'R_5', 'R_6', 'R_7', 'R_8', 'R_9']
+quantitatives = ['S_11', 'S_12', 'S_13', 'S_15', 'S_16', 'S_17', 'S_18', 'S_19', 'S_20', 'S_22', 'S_23', 'S_24', 'S_25', 'S_26', 'S_27', 'S_3', 'S_5', 'S_6', 'S_7', 'S_8', 'S_9', 'B_1', 'B_10', 'B_11', 'B_12', 'B_13', 'B_14', 'B_15', 'B_16', 'B_17', 'B_18', 'B_19', 'B_2', 'B_20', 'B_21', 'B_22', 'B_23', 'B_24', 'B_25', 'B_26', 'B_27', 'B_28', 'B_29', 'B_3', 'B_31', 'B_32', 'B_33', 'B_36', 'B_37', 'B_39', 'B_4', 'B_40', 'B_41', 'B_42', 'B_5', 'B_6', 'B_7', 'B_8', 'B_9', 'D_102', 'D_103', 'D_104', 'D_105', 'D_106', 'D_107', 'D_108', 'D_109', 'D_110', 'D_111', 'D_112', 'D_113', 'D_115', 'D_118', 'D_119', 'D_121', 'D_122', 'D_123', 'D_124', 'D_125', 'D_127', 'D_128', 'D_129', 'D_130', 'D_131', 'D_132', 'D_133', 'D_134', 'D_135', 'D_136', 'D_137', 'D_138', 'D_139', 'D_140', 'D_141', 'D_142', 'D_143', 'D_144', 'D_145', 'D_39', 'D_41', 'D_42', 'D_43', 'D_44', 'D_45', 'D_46', 'D_47', 'D_48', 'D_49', 'D_50', 'D_51', 'D_52', 'D_53', 'D_54', 'D_55', 'D_56', 'D_58', 'D_59', 'D_60', 'D_61', 'D_62', 'D_65', 'D_69', 'D_70', 'D_71', 'D_72', 'D_73', 'D_74', 'D_75', 'D_76', 'D_77', 'D_78', 'D_79', 'D_80', 'D_81', 'D_82', 'D_83', 'D_84', 'D_86', 'D_87', 'D_88', 'D_89', 'D_91', 'D_92', 'D_93', 'D_94', 'D_96', 'P_2', 'P_3', 'P_4', 'R_1', 'R_10', 'R_11', 'R_12', 'R_13', 'R_14', 'R_15', 'R_16', 'R_17', 'R_18', 'R_19', 'R_2', 'R_20', 'R_21', 'R_22', 'R_23', 'R_24', 'R_25', 'R_26', 'R_27', 'R_28', 'R_3', 'R_4', 'R_5', 'R_6', 'R_7', 'R_8', 'R_9']
+qualitatives = ['B_30', 'B_38', 'D_114', 'D_116', 'D_117', 'D_120', 'D_126', 'D_63', 'D_64', 'D_66', 'D_68']
+
+COLS   = [c for c in allcolumns    if c not in excludes]
+QUANTS = [c for c in quantitatives if ((c not in excludes) & (c in allcolumns))]
+QUALS  = [c for c in qualitatives  if ((c not in excludes) & (c in allcolumns))]
+TRAINVARS = ['customer_ID', 'S_2', 'P_2', 'D_39', 'B_1', 'B_2', 'R_1', 'D_41', 'B_3', 'D_44', 'B_4', 'D_45', 'B_5', 'R_2', 'D_47', 'B_6', 'B_7', 'B_8', 'D_51', 'B_9', 'R_3', 'D_52', 'B_10', 'S_5', 'B_11', 'S_6', 'D_54', 'R_4', 'B_12', 'S_8', 'D_55', 'B_13', 'R_5', 'D_58', 'B_14', 'D_59', 'D_60', 'B_15', 'S_11', 'D_65', 'B_16', 'B_18', 'B_19', 'B_20', 'S_12', 'R_6', 'S_13', 'B_21', 'D_69', 'B_22', 'D_70', 'D_71', 'D_72', 'S_15', 'B_23', 'P_4', 'D_74', 'D_75', 'B_24', 'R_7', 'B_25', 'B_26', 'D_78', 'D_79', 'R_8', 'S_16', 'D_80', 'R_10', 'R_11', 'B_27', 'D_81', 'S_17', 'R_12', 'B_28', 'R_13', 'D_83', 'R_14', 'R_15', 'D_84', 'R_16', 'S_18', 'D_86', 'R_17', 'R_18', 'B_31', 'S_19', 'R_19', 'B_32', 'S_20', 'R_20', 'R_21', 'B_33', 'D_89', 'R_22', 'R_23', 'D_91', 'D_92', 'D_93', 'D_94', 'R_24', 'R_25', 'D_96', 'S_22', 'S_23', 'S_24', 'S_25', 'S_26', 'D_102', 'D_103', 'D_104', 'D_107', 'B_36', 'B_37', 'R_27', 'D_109', 'D_112', 'B_40', 'D_113', 'D_115', 'D_118', 'D_119', 'D_121', 'D_122', 'D_123', 'D_124', 'D_125', 'D_127', 'D_128', 'D_129', 'B_41', 'D_130', 'D_131', 'D_133', 'R_28', 'D_139', 'D_140', 'D_141', 'D_143', 'D_144', 'D_145', 'B_30_0.0', 'B_30_1.0', 'B_30_2.0', 'B_30_X', 'B_38_1.0', 'B_38_2.0', 'B_38_3.0', 'B_38_4.0', 'B_38_5.0', 'B_38_6.0', 'B_38_7.0', 'B_38_X', 'D_114_0.0', 'D_114_1.0', 'D_114_X', 'D_116_0.0', 'D_116_1.0', 'D_116_X', 'D_117_-1.0', 'D_117_1.0', 'D_117_2.0', 'D_117_3.0', 'D_117_4.0', 'D_117_5.0', 'D_117_6.0', 'D_117_X', 'D_120_0.0', 'D_120_1.0', 'D_120_X', 'D_126_-1.0', 'D_126_0.0', 'D_126_1.0', 'D_126_X', 'D_63_CL', 'D_63_CO', 'D_63_CR', 'D_63_X', 'D_63_XL', 'D_63_XM', 'D_63_XZ', 'D_64_-1', 'D_64_O', 'D_64_R', 'D_64_U', 'D_64_X', 'D_68_0.0', 'D_68_1.0', 'D_68_2.0', 'D_68_3.0', 'D_68_4.0', 'D_68_5.0', 'D_68_6.0', 'D_68_X']
+
+# read numeric cols with float16 rather than float64
+TYPEDICT = {}
+for c in COLS:
+    if c in (QUALS + ['customer_ID','S_2']):
+        TYPEDICT[c] = object
+    else:
+        TYPEDICT[c] = np.float16
+                             
+logging.debug("LOADING raw_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+train_X = pd.read_csv(DATADIR + 'train_data.csv', dtype=TYPEDICT, usecols=COLS)
+
+logging.debug("train_X shape",train_X.shape,"customers",len(train_X.customer_ID.unique()))
+
+logging.debug("CALCULATING MEDIANS ON train_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+MEDS = {}
+for c in QUANTS:
+    MEDS[c] = train_X[c].median()
+
+logging.debug("PREPROCESSING train_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+train_X = preprocess(train_X)
+
+logging.debug("preprocessed train_X shape",train_X.shape,"customers",len(train_X.customer_ID.unique()))
+
+logging.debug("LOADING train_Y: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+train_Y = pd.read_csv(DATADIR + 'train_labels.csv')
+
+logging.debug("train_Y shape",train_Y.shape,"customers",len(train_Y.customer_ID.unique()))
+
+#
+# Train the model
+#
+
+logging.debug("FITTING MODEL: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+from keras import Sequential
+from keras.layers import Dense, LSTM,TimeDistributed
+
+FEATURES = train_X.shape[1] - 2
+CUSTOMERS = int(train_X.shape[0] / PERIODS)
+
+def create_model():
+    model = Sequential(name="kaggle_amex_default")
+    model.add(LSTM(units=32, input_shape=(PERIODS, FEATURES), return_sequences=True))
+    model.add(LSTM(units=32, return_sequences=True))
+    model.add(LSTM(units=32, return_sequences=True))
+    model.add(LSTM(units=32, return_sequences=True))
+    model.add(LSTM(units=32))
+    model.add(Dense(1, activation='sigmoid'))
+    logging.debug(model.summary())
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+model = create_model()
+
+history = model.fit(train_X.iloc[:,2:].to_numpy().reshape(CUSTOMERS,PERIODS,FEATURES),
+          train_Y.target, epochs=EPOCHS, batch_size=BATCHSIZE)
+model.save(OUTDIR + 'amex-default')
+
+logging.debug("CLEAN UP AFTER MODEL FIT: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+
+train_X.to_csv(OUTDIR + 'X.csv')
+train_Y.to_csv(OUTDIR + 'Y.csv')
+
+del train_X
+del train_Y
+delobjs = gc.collect()
+
+#
+# Predict and generate submission.csv
+#
+
+logging.debug("PREDICTING: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+
+# initialize pred_Y
+pred_Y = pd.DataFrame(columns=["customer_ID","prediction"])
+pred_Y['customer_ID'] = pred_Y['customer_ID'].astype(object)
+pred_Y['prediction'] = pred_Y['prediction'].astype(np.float64)
+pred_Y.to_csv('submission.csv')  # write out just the header row
+
+chunk_count = 0
+partial = pd.read_csv(DATADIR+'test_data.csv', sep=',', dtype=TYPEDICT, usecols=COLS, nrows=0)
+
+for chunk in pd.read_csv(DATADIR+'test_data.csv', sep=',', dtype=TYPEDICT, 
+                         usecols=COLS, iterator=True, chunksize=PREDICTION_CHUNKSIZE):
+    chunk_count+=1
+    if chunk_count == 23:
+        # cant debug processing this last chunk - one customer
+        pd.DataFrame.from_dict({'customer_ID':['fffffa7cf7e453e1acc6a1426475d5cb9400859f82ff61cceb803ea8ec37634d'],
+                                'prediction':[.05]}).to_csv('submission.csv', mode='a', header=False)
+    else:
+        logging.debug("    PROCESSING CHUNK:",chunk_count,"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+        work = pd.concat([partial,chunk], axis=0)
+        partial = work[work['customer_ID'] == work.iloc[work.shape[0]-1].customer_ID]
+        work =    work[work['customer_ID'] != work.iloc[work.shape[0]-1].customer_ID]
+        preprocessed_work = preprocess(work)
+        customers_in_chunk = len(preprocessed_work.customer_ID.unique())
+        chunk_pred = pd.DataFrame()
+        chunk_pred["customer_ID"] = preprocessed_work["customer_ID"].unique()
+        chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
+        #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
+        chunk_pred.to_csv('submission.csv', mode='a', header=False)
+    gc.collect()
+
+logging.debug("PREDICTING THE LAST CUSTOMER IN THE TEST DATA: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))   
+if partial.shape[0] > 0:
+    preprocessed_work = preprocess(partial)
+    customers_in_chunk = len(preprocessed_work.customer_ID.unique())
+    chunk_pred = pd.DataFrame()
+    chunk_pred["customer_ID"] = preprocessed_work["customer_ID"]
+    chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
+    #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
+    chunk_pred.to_csv('submission.csv', mode='a', header=False)
+    
+pred_Y[['customer_ID','prediction']].to_csv('submission.csv')  
+
+logging.debug("DONE: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+2022-08-19 18:41:44.242024: I tensorflow/core/common_runtime/process_util.cc:146] Creating new thread pool with default inter op setting: 2. Tune using inter_op_parallelism_threads for best performance.
+Model: "kaggle_amex_default"
+_________________________________________________________________
+Layer (type)                 Output Shape              Param #   
+=================================================================
+lstm (LSTM)                  (None, 6, 32)             28672     
+_________________________________________________________________
+lstm_1 (LSTM)                (None, 6, 32)             8320      
+_________________________________________________________________
+lstm_2 (LSTM)                (None, 6, 32)             8320      
+_________________________________________________________________
+lstm_3 (LSTM)                (None, 6, 32)             8320      
+_________________________________________________________________
+lstm_4 (LSTM)                (None, 32)                8320      
+_________________________________________________________________
+dense (Dense)                (None, 1)                 33        
+=================================================================
+Total params: 61,985
+Trainable params: 61,985
+Non-trainable params: 0
+_________________________________________________________________
+2022-08-19 18:41:54.399148: I tensorflow/compiler/mlir/mlir_graph_optimization_pass.cc:185] None of the MLIR Optimization Passes are enabled (registered 2)
+7171/7171 [==============================] - 272s 36ms/step - loss: 0.5725 - accuracy: 0.7411
+2022-08-19 18:46:36.026810: W tensorflow/python/util/util.cc:348] Sets are not currently considered sequences, but this may change in the future, so consider avoiding using them.
+2022-08-19 18:46:44,192 [MainThread  ] [WARNI]  Found untraced functions such as lstm_cell_layer_call_and_return_conditional_losses, lstm_cell_layer_call_fn, lstm_cell_1_layer_call_and_return_conditional_losses, lstm_cell_1_layer_call_fn, lstm_cell_2_layer_call_and_return_conditional_losses while saving (showing 5 of 25). These functions will not be directly callable after loading.
+2022-08-19 18:46:46,186 [MainThread  ] [INFO ]  Assets written to: ./amex-default/assets
+---------------------------------------------------------------------------
+ValueError                                Traceback (most recent call last)
+/tmp/ipykernel_19/3753148375.py in <module>
+    266     chunk_pred = pd.DataFrame()
+    267     chunk_pred["customer_ID"] = preprocessed_work["customer_ID"]
+--> 268     chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
+    269     #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
+    270     chunk_pred.to_csv('submission.csv', mode='a', header=False)
+
+/opt/conda/lib/python3.7/site-packages/pandas/core/frame.py in __setitem__(self, key, value)
+   3610         else:
+   3611             # set column
+-> 3612             self._set_item(key, value)
+   3613 
+   3614     def _setitem_slice(self, key: slice, value):
+
+/opt/conda/lib/python3.7/site-packages/pandas/core/frame.py in _set_item(self, key, value)
+   3782         ensure homogeneity.
+   3783         """
+-> 3784         value = self._sanitize_column(value)
+   3785 
+   3786         if (
+
+/opt/conda/lib/python3.7/site-packages/pandas/core/frame.py in _sanitize_column(self, value)
+   4507 
+   4508         if is_list_like(value):
+-> 4509             com.require_length_match(value, self.index)
+   4510         return sanitize_array(value, self.index, copy=True, allow_2d=True)
+   4511 
+
+/opt/conda/lib/python3.7/site-packages/pandas/core/common.py in require_length_match(data, index)
+    530     if len(data) != len(index):
+    531         raise ValueError(
+--> 532             "Length of values "
+    533             f"({len(data)}) "
+    534             "does not match length of index "
+
+ValueError: Length of values (1) does not match length of index (6)
+ 
+ 
