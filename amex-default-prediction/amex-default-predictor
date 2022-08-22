@@ -41,7 +41,7 @@ consoleHandler.setFormatter(logFormatter)
 rootLogger.addHandler(consoleHandler)
 logging.basicConfig(level=logging.DEBUG)
 
-logging.debug("STARTING: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("STARTING: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 
 #
 # Exploratory Data Analysis (EDA)
@@ -138,7 +138,7 @@ def preprocess(raw_X):
 PERIODS = 6
 DATADIR = '../input/amex-default-prediction/'
 OUTDIR = './'
-PREDICTION_CHUNKSIZE = 500000
+PREDICTION_CHUNKSIZE = 250000
 BATCHSIZE = 64
 EPOCHS = 1
 
@@ -165,47 +165,49 @@ for c in COLS:
     else:
         TYPEDICT[c] = np.float16
                              
-logging.debug("LOADING raw_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("LOADING raw_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 train_X = pd.read_csv(DATADIR + 'train_data.csv', dtype=TYPEDICT, usecols=COLS)
 
-logging.debug("train_X shape",train_X.shape,"customers",len(train_X.customer_ID.unique()))
+print("train_X shape",train_X.shape,"customers",len(train_X.customer_ID.unique()))
 
-logging.debug("CALCULATING MEDIANS ON train_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("CALCULATING MEDIANS ON train_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 MEDS = {}
 for c in QUANTS:
     MEDS[c] = train_X[c].median()
 
-logging.debug("PREPROCESSING train_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("PREPROCESSING train_X: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 train_X = preprocess(train_X)
 
-logging.debug("preprocessed train_X shape",train_X.shape,"customers",len(train_X.customer_ID.unique()))
+print("preprocessed train_X shape",train_X.shape,"customers",len(train_X.customer_ID.unique()))
 
-logging.debug("LOADING train_Y: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("LOADING train_Y: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 train_Y = pd.read_csv(DATADIR + 'train_labels.csv')
 
-logging.debug("train_Y shape",train_Y.shape,"customers",len(train_Y.customer_ID.unique()))
+print("train_Y shape",train_Y.shape,"customers",len(train_Y.customer_ID.unique()))
 
 #
 # Train the model
 #
 
-logging.debug("FITTING MODEL: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("FITTING MODEL: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 from keras import Sequential
-from keras.layers import Dense, LSTM,TimeDistributed
+from keras.layers import Dense, LSTM
+from tensorflow import keras
 
 FEATURES = train_X.shape[1] - 2
 CUSTOMERS = int(train_X.shape[0] / PERIODS)
 
 def create_model():
     model = Sequential(name="kaggle_amex_default")
-    model.add(LSTM(units=32, input_shape=(PERIODS, FEATURES), return_sequences=True))
-    model.add(LSTM(units=32, return_sequences=True))
-    model.add(LSTM(units=32, return_sequences=True))
-    model.add(LSTM(units=32, return_sequences=True))
-    model.add(LSTM(units=32))
+    model.add(LSTM(units=128, input_shape=(PERIODS, FEATURES), return_sequences=True))
+    model.add(LSTM(units=128, return_sequences=True))
+    model.add(LSTM(units=128, return_sequences=True))
+    model.add(LSTM(units=128, return_sequences=True))
+    model.add(LSTM(units=128))
     model.add(Dense(1, activation='sigmoid'))
-    logging.debug(model.summary())
-    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    print(model.summary())
+    opt = keras.optimizers.Adam(learning_rate=0.0001)
+    model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy'])
     return model
 
 model = create_model()
@@ -214,10 +216,10 @@ history = model.fit(train_X.iloc[:,2:].to_numpy().reshape(CUSTOMERS,PERIODS,FEAT
           train_Y.target, epochs=EPOCHS, batch_size=BATCHSIZE)
 model.save(OUTDIR + 'amex-default')
 
-logging.debug("CLEAN UP AFTER MODEL FIT: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("CLEAN UP AFTER MODEL FIT: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 
-train_X.to_csv(OUTDIR + 'X.csv')
-train_Y.to_csv(OUTDIR + 'Y.csv')
+#train_X.to_csv(OUTDIR + 'X.csv')
+#train_Y.to_csv(OUTDIR + 'Y.csv')
 
 del train_X
 del train_Y
@@ -227,13 +229,13 @@ delobjs = gc.collect()
 # Predict and generate submission.csv
 #
 
-logging.debug("PREDICTING: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+print("PREDICTING: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
 
 # initialize pred_Y
 pred_Y = pd.DataFrame(columns=["customer_ID","prediction"])
 pred_Y['customer_ID'] = pred_Y['customer_ID'].astype(object)
 pred_Y['prediction'] = pred_Y['prediction'].astype(np.float64)
-pred_Y.to_csv('submission.csv')  # write out just the header row
+pred_Y.to_csv('submission.csv', index=False)  # write out just the header row
 
 chunk_count = 0
 partial = pd.read_csv(DATADIR+'test_data.csv', sep=',', dtype=TYPEDICT, usecols=COLS, nrows=0)
@@ -241,100 +243,33 @@ partial = pd.read_csv(DATADIR+'test_data.csv', sep=',', dtype=TYPEDICT, usecols=
 for chunk in pd.read_csv(DATADIR+'test_data.csv', sep=',', dtype=TYPEDICT, 
                          usecols=COLS, iterator=True, chunksize=PREDICTION_CHUNKSIZE):
     chunk_count+=1
-    if chunk_count == 23:
-        # cant debug processing this last chunk - one customer
-        pd.DataFrame.from_dict({'customer_ID':['fffffa7cf7e453e1acc6a1426475d5cb9400859f82ff61cceb803ea8ec37634d'],
-                                'prediction':[.05]}).to_csv('submission.csv', mode='a', header=False)
-    else:
-        logging.debug("    PROCESSING CHUNK:",chunk_count,"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
-        work = pd.concat([partial,chunk], axis=0)
-        partial = work[work['customer_ID'] == work.iloc[work.shape[0]-1].customer_ID]
-        work =    work[work['customer_ID'] != work.iloc[work.shape[0]-1].customer_ID]
-        preprocessed_work = preprocess(work)
-        customers_in_chunk = len(preprocessed_work.customer_ID.unique())
-        chunk_pred = pd.DataFrame()
-        chunk_pred["customer_ID"] = preprocessed_work["customer_ID"].unique()
-        chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
-        #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
-        chunk_pred.to_csv('submission.csv', mode='a', header=False)
+#    if chunk_count == 23:
+#        # cant debug processing this last chunk - one customer
+#        pd.DataFrame.from_dict({'customer_ID':['fffffa7cf7e453e1acc6a1426475d5cb9400859f82ff61cceb803ea8ec37634d'],
+#                                'prediction':[.05]}).to_csv('submission.csv', mode='a', header=False, index=False)
+#    else:
+    print("    PROCESSING CHUNK:",chunk_count,"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
+    work = pd.concat([partial,chunk], axis=0)
+    partial = work[work['customer_ID'] == work.iloc[work.shape[0]-1].customer_ID]
+    work =    work[work['customer_ID'] != work.iloc[work.shape[0]-1].customer_ID]
+    preprocessed_work = preprocess(work)
+    customers_in_chunk = len(preprocessed_work.customer_ID.unique())
+    chunk_pred = pd.DataFrame()
+    chunk_pred["customer_ID"] = preprocessed_work["customer_ID"].unique()
+    chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
+    #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
+    chunk_pred.to_csv('submission.csv', mode='a', header=False, index=False)
+    # , line_terminator='\n'
     gc.collect()
 
-logging.debug("PREDICTING THE LAST CUSTOMER IN THE TEST DATA: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))   
+print("PREDICTING THE LAST CUSTOMER IN THE TEST DATA: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))   
 if partial.shape[0] > 0:
     preprocessed_work = preprocess(partial)
     customers_in_chunk = len(preprocessed_work.customer_ID.unique())
     chunk_pred = pd.DataFrame()
-    chunk_pred["customer_ID"] = preprocessed_work["customer_ID"]
+    chunk_pred["customer_ID"] = preprocessed_work["customer_ID"].unique()
     chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
     #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
-    chunk_pred.to_csv('submission.csv', mode='a', header=False)
-    
-pred_Y[['customer_ID','prediction']].to_csv('submission.csv')  
+    chunk_pred.to_csv('submission.csv', mode='a', header=False, index=False)
 
-logging.debug("DONE: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
-2022-08-19 18:41:44.242024: I tensorflow/core/common_runtime/process_util.cc:146] Creating new thread pool with default inter op setting: 2. Tune using inter_op_parallelism_threads for best performance.
-Model: "kaggle_amex_default"
-_________________________________________________________________
-Layer (type)                 Output Shape              Param #   
-=================================================================
-lstm (LSTM)                  (None, 6, 32)             28672     
-_________________________________________________________________
-lstm_1 (LSTM)                (None, 6, 32)             8320      
-_________________________________________________________________
-lstm_2 (LSTM)                (None, 6, 32)             8320      
-_________________________________________________________________
-lstm_3 (LSTM)                (None, 6, 32)             8320      
-_________________________________________________________________
-lstm_4 (LSTM)                (None, 32)                8320      
-_________________________________________________________________
-dense (Dense)                (None, 1)                 33        
-=================================================================
-Total params: 61,985
-Trainable params: 61,985
-Non-trainable params: 0
-_________________________________________________________________
-2022-08-19 18:41:54.399148: I tensorflow/compiler/mlir/mlir_graph_optimization_pass.cc:185] None of the MLIR Optimization Passes are enabled (registered 2)
-7171/7171 [==============================] - 272s 36ms/step - loss: 0.5725 - accuracy: 0.7411
-2022-08-19 18:46:36.026810: W tensorflow/python/util/util.cc:348] Sets are not currently considered sequences, but this may change in the future, so consider avoiding using them.
-2022-08-19 18:46:44,192 [MainThread  ] [WARNI]  Found untraced functions such as lstm_cell_layer_call_and_return_conditional_losses, lstm_cell_layer_call_fn, lstm_cell_1_layer_call_and_return_conditional_losses, lstm_cell_1_layer_call_fn, lstm_cell_2_layer_call_and_return_conditional_losses while saving (showing 5 of 25). These functions will not be directly callable after loading.
-2022-08-19 18:46:46,186 [MainThread  ] [INFO ]  Assets written to: ./amex-default/assets
----------------------------------------------------------------------------
-ValueError                                Traceback (most recent call last)
-/tmp/ipykernel_19/3753148375.py in <module>
-    266     chunk_pred = pd.DataFrame()
-    267     chunk_pred["customer_ID"] = preprocessed_work["customer_ID"]
---> 268     chunk_pred["prediction"] = model.predict(preprocessed_work.iloc[:,2:].to_numpy().reshape(customers_in_chunk,PERIODS,FEATURES))
-    269     #pred_Y = pd.concat([pred_Y,chunk_pred],axis=0)
-    270     chunk_pred.to_csv('submission.csv', mode='a', header=False)
-
-/opt/conda/lib/python3.7/site-packages/pandas/core/frame.py in __setitem__(self, key, value)
-   3610         else:
-   3611             # set column
--> 3612             self._set_item(key, value)
-   3613 
-   3614     def _setitem_slice(self, key: slice, value):
-
-/opt/conda/lib/python3.7/site-packages/pandas/core/frame.py in _set_item(self, key, value)
-   3782         ensure homogeneity.
-   3783         """
--> 3784         value = self._sanitize_column(value)
-   3785 
-   3786         if (
-
-/opt/conda/lib/python3.7/site-packages/pandas/core/frame.py in _sanitize_column(self, value)
-   4507 
-   4508         if is_list_like(value):
--> 4509             com.require_length_match(value, self.index)
-   4510         return sanitize_array(value, self.index, copy=True, allow_2d=True)
-   4511 
-
-/opt/conda/lib/python3.7/site-packages/pandas/core/common.py in require_length_match(data, index)
-    530     if len(data) != len(index):
-    531         raise ValueError(
---> 532             "Length of values "
-    533             f"({len(data)}) "
-    534             "does not match length of index "
-
-ValueError: Length of values (1) does not match length of index (6)
- 
- 
+print("DONE: "+"Mem: {:.2f}G".format(psutil.virtual_memory()[1]/1000000000))
