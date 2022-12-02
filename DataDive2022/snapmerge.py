@@ -42,4 +42,4 @@ fips = pd.merge(fipscounty,fipsstate,on='stateFIPS',how='left')
 
 # Merge the SNAP with FIPS reference data
 snapmerge = pd.merge(snap,fips,on='countyFIPS',how='left')
-snapmerge.to_csv('snapmerge.csv')
+snapmerge.to_csv('snapmerge.csv', index=False)
