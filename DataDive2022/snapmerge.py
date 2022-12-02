@@ -1,6 +1,35 @@
 #
 # SNAP Biannual Participation and Issuance dataset
 #
+"""
+Generates the snapmerge dataset, combining biannual files against FIPS county and state codes.
+66 files with about 2600 observations per report for 183,005 rows total.
+
+Columns:
+
+    month,year:  JAN or JUL for 1999-2001  in 
+
+    Substate:  Name of the reporting office
+    
+    Participation counts of Persons and Housholds
+        PersonsPublic:
+        PersonsNonPublic:
+        PersonsTotal,
+        HouseholdsPublicAssistance:
+        HouseholdsNonPublicAssistance,
+        HouseholdsTotal:
+
+    Issuance:  SNAP benefits issued
+
+    countyFIPS:
+    countyNAME:
+    stateFIPS:
+    stateNAME:
+
+"""
+
+
+
 import pandas as pd
 import os
 
@@ -42,4 +71,6 @@ fips = pd.merge(fipscounty,fipsstate,on='stateFIPS',how='left')
 
 # Merge the SNAP with FIPS reference data
 snapmerge = pd.merge(snap,fips,on='countyFIPS',how='left')
+snapmerge.drop(['stateFIPS_x'], axis=1, inplace=True)
+snapmerge.rename(columns={"stateFIPS_y": "stateFIPS"},inplace=True)
 snapmerge.to_csv('snapmerge.csv', index=False)
